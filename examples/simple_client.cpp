@@ -1,7 +1,27 @@
 #include <iostream>
+#include <cstring>
+#include <drpc/rpc.h>
 
 int main() {
-    std::cout << "Simple RPC Client" << std::endl;
-    std::cout << "TODO: Implement RPC client example" << std::endl;
+    drpc::RpcClient client;
+    
+    if (!client.connect("127.0.0.1", 12345)) {
+        std::cerr << "Failed to connect to server" << std::endl;
+        return 1;
+    }
+    
+    std::cout << "Connected to server" << std::endl;
+    
+    const char* msg = "Hello from client!";
+    char resp[1024];
+    size_t resp_len = sizeof(resp);
+    
+    if (client.call(1, msg, strlen(msg), resp, resp_len)) {
+        std::cout << "Response: " << std::string(resp, resp_len) << std::endl;
+    } else {
+        std::cerr << "RPC call failed" << std::endl;
+    }
+    
+    client.disconnect();
     return 0;
 }

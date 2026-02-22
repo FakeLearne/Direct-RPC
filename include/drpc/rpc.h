@@ -3,70 +3,42 @@
 
 #include <drpc/common.h>
 #include <drpc/transport.h>
-#include <drpc/buffer.h>
-#include <drpc/connection.h>
 #include <drpc/protocol.h>
-#include <drpc/dispatcher.h>
 
 namespace drpc {
 
-using RPCHandler = std::function<void(const void* req, size_t req_len,
-                                       void* resp, size_t& resp_len)>;
+// RPC处理函数类型
+using RpcHandler = std::function<void(const void* req, size_t req_len,
+                                      void* resp, size_t& resp_len)>;
 
+// RPC服务端
 class RpcServer {
 public:
-    RpcServer(const char* addr, uint16_t port);
+    RpcServer(const char* addr, uint16_t port);  // 构造，指定监听地址和端口
     ~RpcServer();
 
     RpcServer(const RpcServer&) = delete;
     RpcServer& operator=(const RpcServer&) = delete;
 
-    void registerHandler(uint32_t func_id, RPCHandler handler);
-
-    Status start();
-    void stop();
-    bool running() const { return running_.load(); }
-
-    void setThreadCount(int count) { thread_count_ = count; }
-    void setMaxConnections(int count) { max_connections_ = count; }
-
-    size_t connectionCount() const;
-    uint64_t requestCount() const { return request_count_.load(); }
+    void registerHandler(uint32_t func_id, RpcHandler handler);  // 注册RPC处理函数
+    
+    bool start();                        // 启动服务
+    void stop();                         // 停止服务
+    void run();                          // 运行事件循环
 
 private:
-    void acceptLoop();
-    void handleConnection(std::unique_ptr<Connection> conn);
-    void handleRequest(Connection& conn, const MessageHeader& hdr, const void* data);
+    void handleClient(Connection& conn);            // 处理客户端连接
+    void processRequest(Connection& conn, const MsgHeader* hdr);  // 处理RPC请求
 
-    std::string bind_addr_;
-    uint16_t bind_port_;
-
-    std::unique_ptr<RdmaContext> context_;
-    std::unique_ptr<ProtectionDomain> pd_;
-    std::unique_ptr<CompletionQueue> send_cq_;
-    std::unique_ptr<CompletionQueue> recv_cq_;
-    std::unique_ptr<MemoryPool> pool_;
-    std::unique_ptr<ConnectionManager> cm_;
-
-    std::unordered_map<uint32_t, RPCHandler> handlers_;
-    std::vector<std::unique_ptr<Connection>> connections_;
-    mutable std::mutex connections_mutex_;
-
-    std::atomic<bool> running_{false};
-    std::atomic<uint64_t> request_count_{0};
-    std::thread accept_thread_;
-    std::vector<std::thread> worker_threads_;
-
-    int thread_count_ = 1;
-    int max_connections_ = 100;
+    std::string addr_;                   // 监听地址
+    uint16_t port_;                      // 监听端口
+    Transport transport_;                // RDMA传输层
+    rdma_cm_id* listen_id_ = nullptr;    // rdma_cm监听ID
+    std::unordered_map<uint32_t, RpcHandler> handlers_;  // RPC处理函数表
+    std::atomic<bool> running_{false};   // 运行状态
 };
 
-enum class CallMode {
-    SYNC,
-    ASYNC,
-    PULL
-};
-
+// RPC客户端
 class RpcClient {
 public:
     RpcClient();
@@ -75,42 +47,21 @@ public:
     RpcClient(const RpcClient&) = delete;
     RpcClient& operator=(const RpcClient&) = delete;
 
-    Status connect(const char* addr, uint16_t port, int timeout_ms = DEFAULT_TIMEOUT_MS);
-    void disconnect();
-    bool connected() const { return connected_.load(); }
+    bool connect(const char* addr, uint16_t port, int timeout_ms = DEFAULT_TIMEOUT_MS);  // 连接服务端
+    void disconnect();                   // 断开连接
+    
+    // 同步RPC调用
+    bool call(uint32_t func_id, const void* req, size_t req_len,
+              void* resp, size_t& resp_len, int timeout_ms = DEFAULT_TIMEOUT_MS);
 
-    Buffer call(uint32_t func_id, const void* req, size_t req_len,
-                int timeout_ms = DEFAULT_TIMEOUT_MS);
-
-    Buffer callWithPull(uint32_t func_id, const void* req, size_t req_len,
-                        int timeout_ms = DEFAULT_TIMEOUT_MS);
-
-    uint32_t asyncCall(uint32_t func_id, const void* req, size_t req_len,
-                       std::function<void(Buffer&)> callback);
-
-    bool wait(uint32_t seq_id, int timeout_ms = DEFAULT_TIMEOUT_MS);
-    bool waitAll(int timeout_ms = DEFAULT_TIMEOUT_MS);
-
-    void setCallMode(CallMode mode) { default_call_mode_ = mode; }
+    bool connected() const { return conn_ && conn_->connected(); }  // 检查连接状态
 
 private:
-    Buffer doSyncCall(uint32_t func_id, const void* req, size_t req_len,
-                      int timeout_ms, CallMode mode);
-    void handleDataReady(const DataReadyInfo& info, Buffer& recv_buf, uint32_t seq_id);
+    bool waitForResponse(uint32_t seq_id, Buffer& recv_buf, int timeout_ms);  // 等待响应
 
-    std::unique_ptr<RdmaContext> context_;
-    std::unique_ptr<ProtectionDomain> pd_;
-    std::unique_ptr<CompletionQueue> send_cq_;
-    std::unique_ptr<CompletionQueue> recv_cq_;
-    std::unique_ptr<MemoryPool> pool_;
-    std::unique_ptr<Connection> connection_;
-    std::unique_ptr<Transport> transport_;
-    std::unique_ptr<Dispatcher> dispatcher_;
-    std::unique_ptr<RequestContextManager> ctx_manager_;
-
-    std::atomic<uint32_t> next_seq_id_{1};
-    std::atomic<bool> connected_{false};
-    CallMode default_call_mode_ = CallMode::SYNC;
+    Transport transport_;                              // RDMA传输层
+    std::unique_ptr<Connection> conn_;                 // 连接对象
+    std::atomic<uint32_t> next_seq_id_{1};             // 下一个序列号
 };
 
 }

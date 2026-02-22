@@ -5,6 +5,3 @@ target_link_libraries(simple_server PRIVATE drpc_static)
 
 add_executable(simple_client simple_client.cpp)
 target_link_libraries(simple_client PRIVATE drpc_static)
-
-add_executable(benchmark benchmark.cpp)
-target_link_libraries(benchmark PRIVATE drpc_static)

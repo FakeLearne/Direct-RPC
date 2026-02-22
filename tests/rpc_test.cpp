@@ -1,12 +1,12 @@
 #include <iostream>
-#include <cstring>
 #include <drpc/rpc.h>
 
 int main() {
     drpc::RpcServer server("0.0.0.0", 12345);
     
     server.registerHandler(1, [](const void* req, size_t req_len, void* resp, size_t& resp_len) {
-        std::cout << "Received: " << std::string((const char*)req, req_len) << std::endl;
+        const char* msg = static_cast<const char*>(req);
+        std::cout << "Received: " << std::string(msg, req_len) << std::endl;
         
         const char* reply = "Hello from server!";
         size_t len = strlen(reply);
