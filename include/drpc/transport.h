@@ -17,29 +17,29 @@ public:
     Transport(const Transport&) = delete;
     Transport& operator=(const Transport&) = delete;
 
-    bool init();                        // 初始化RDMA资源
+    ErrorCode init();                  // 初始化RDMA资源，返回错误码
     
     ibv_pd* pd() { return pd_; }        // 获取保护域
     ibv_cq* cq() { return cq_; }        // 获取完成队列
     ibv_context* context() { return ctx_; }  // 获取设备上下文
     MemoryPool& pool() { return *pool_; }    // 获取内存池
 
-    int pollCompletion(ibv_wc& wc, int timeout_ms = 0);  // 轮询完成事件
+    // 轮询完成事件，返回错误码
+    ErrorCode pollCompletion(ibv_wc& wc, int timeout_ms = 0);
 
-    // 静态方法：提交各类RDMA操作
-    static int postSend(ibv_qp* qp, const Buffer& buf, size_t len, 
-                        uint64_t wr_id, bool inline_flag = false);  // 提交Send操作
-    static int postSendImm(ibv_qp* qp, const Buffer& buf, size_t len,
-                           uint64_t wr_id, uint32_t imm_data);      // 提交Send with Imm操作
-    static int postRecv(ibv_qp* qp, const Buffer& buf, uint64_t wr_id);  // 提交Recv操作
-    static int postWrite(ibv_qp* qp, const Buffer& buf, size_t len, uint64_t wr_id,
-                         uint32_t remote_rkey, uint64_t remote_addr, 
-                         bool inline_flag = false);                  // 提交RDMA Write操作
-    static int postWriteImm(ibv_qp* qp, const Buffer& buf, size_t len, uint64_t wr_id,
-                            uint32_t remote_rkey, uint64_t remote_addr, 
-                            uint32_t imm_data);                      // 提交RDMA Write with Imm操作
-    static int postRead(ibv_qp* qp, const Buffer& buf, size_t len, uint64_t wr_id,
-                        uint32_t remote_rkey, uint64_t remote_addr);  // 提交RDMA Read操作
+    // 静态方法：提交各类RDMA操作，返回错误码
+    static ErrorCode postSend(ibv_qp* qp, const Buffer& buf, size_t len, 
+                              uint64_t wr_id, bool inline_flag = false);
+    static ErrorCode postSendImm(ibv_qp* qp, const Buffer& buf, size_t len,
+                                 uint64_t wr_id, uint32_t imm_data);
+    static ErrorCode postRecv(ibv_qp* qp, const Buffer& buf, uint64_t wr_id);
+    static ErrorCode postWrite(ibv_qp* qp, const Buffer& buf, size_t len, uint64_t wr_id,
+                               uint32_t remote_rkey, uint64_t remote_addr, 
+                               bool inline_flag = false);
+    static ErrorCode postWriteImm(ibv_qp* qp, const Buffer& buf, size_t len, uint64_t wr_id,
+                                  uint32_t remote_rkey, uint64_t remote_addr, uint32_t imm_data);
+    static ErrorCode postRead(ibv_qp* qp, const Buffer& buf, size_t len, uint64_t wr_id,
+                              uint32_t remote_rkey, uint64_t remote_addr);
 
 private:
     ibv_context* ctx_ = nullptr;        // 设备上下文
@@ -57,8 +57,8 @@ public:
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;
 
-    bool connect(const char* addr, uint16_t port, int timeout_ms = DEFAULT_TIMEOUT_MS);  // 客户端连接
-    bool accept(rdma_cm_id* listener_id, int timeout_ms = DEFAULT_TIMEOUT_MS);           // 服务端接受连接
+    ErrorCode connect(const char* addr, uint16_t port, int timeout_ms = DEFAULT_TIMEOUT_MS);  // 客户端连接
+    ErrorCode accept(rdma_cm_id* listener_id, int timeout_ms = DEFAULT_TIMEOUT_MS);           // 服务端接受连接
     void close();                       // 关闭连接
 
     bool connected() const { return connected_; }  // 检查连接状态
@@ -74,18 +74,18 @@ public:
     Buffer getRecvBuffer();             // 获取接收缓冲区
     void returnBuffer(Buffer& buf);     // 归还缓冲区
 
-    int send(const Buffer& buf, size_t len, uint64_t wr_id, bool inline_flag = false);  // 发送数据
-    int sendImm(const Buffer& buf, size_t len, uint64_t wr_id, uint32_t imm_data);      // 发送带立即数
-    int recv(const Buffer& buf, uint64_t wr_id);          // 投递接收缓冲区
-    int write(const Buffer& buf, size_t len, uint64_t wr_id, bool inline_flag = false); // RDMA Write
-    int writeImm(const Buffer& buf, size_t len, uint64_t wr_id, uint32_t imm_data);     // RDMA Write with Imm
-    int read(const Buffer& buf, size_t len, uint64_t wr_id);  // RDMA Read
+    ErrorCode send(const Buffer& buf, size_t len, uint64_t wr_id, bool inline_flag = false);  // 发送数据
+    ErrorCode sendImm(const Buffer& buf, size_t len, uint64_t wr_id, uint32_t imm_data);      // 发送带立即数
+    ErrorCode recv(const Buffer& buf, uint64_t wr_id);          // 投递接收缓冲区
+    ErrorCode write(const Buffer& buf, size_t len, uint64_t wr_id, bool inline_flag = false); // RDMA Write
+    ErrorCode writeImm(const Buffer& buf, size_t len, uint64_t wr_id, uint32_t imm_data);     // RDMA Write with Imm
+    ErrorCode read(const Buffer& buf, size_t len, uint64_t wr_id);  // RDMA Read
 
 private:
-    bool setupQP();                     // 创建QP
-    bool transitionToInit();            // QP状态转换: -> INIT
-    bool transitionToRTR();             // QP状态转换: INIT -> RTR
-    bool transitionToRTS();             // QP状态转换: RTR -> RTS
+    ErrorCode setupQP();                 // 创建QP
+    ErrorCode transitionToInit();        // QP状态转换: -> INIT
+    ErrorCode transitionToRTR();         // QP状态转换: INIT -> RTR
+    ErrorCode transitionToRTS();         // QP状态转换: RTR -> RTS
 
     Transport& transport_;              // 传输层引用
     rdma_cm_id* cm_id_ = nullptr;       // rdma_cm连接ID

@@ -13,15 +13,17 @@ Connection::~Connection() {
 }
 
 // 客户端连接：通过rdma_cm建立RDMA连接
-bool Connection::connect(const char* addr, uint16_t port, int timeout_ms) {
+ErrorCode Connection::connect(const char* addr, uint16_t port, int timeout_ms) {
+    if (!addr) return ErrorCode::INVALID_PARAM;
+    
     // 创建事件通道
     rdma_event_channel* channel = rdma_create_event_channel();
-    if (!channel) return false;
+    if (!channel) return ErrorCode::CREATE_FAILED;
     
     // 创建cm_id
     if (rdma_create_id(channel, &cm_id_, nullptr, RDMA_PS_TCP)) {
         rdma_destroy_event_channel(channel);
-        return false;
+        return ErrorCode::CREATE_FAILED;
     }
     
     // 解析服务器地址
@@ -35,7 +37,8 @@ bool Connection::connect(const char* addr, uint16_t port, int timeout_ms) {
     if (rdma_resolve_addr(cm_id_, nullptr, (sockaddr*)&server_addr, timeout_ms)) {
         rdma_destroy_id(cm_id_);
         rdma_destroy_event_channel(channel);
-        return false;
+        cm_id_ = nullptr;
+        return ErrorCode::CONNECT_FAILED;
     }
     
     // 等待地址解析完成
@@ -43,14 +46,16 @@ bool Connection::connect(const char* addr, uint16_t port, int timeout_ms) {
     if (rdma_get_cm_event(channel, &event)) {
         rdma_destroy_id(cm_id_);
         rdma_destroy_event_channel(channel);
-        return false;
+        cm_id_ = nullptr;
+        return ErrorCode::CONNECT_FAILED;
     }
     
     if (event->event != RDMA_CM_EVENT_ADDR_RESOLVED) {
         rdma_ack_cm_event(event);
         rdma_destroy_id(cm_id_);
         rdma_destroy_event_channel(channel);
-        return false;
+        cm_id_ = nullptr;
+        return ErrorCode::CONNECT_FAILED;
     }
     rdma_ack_cm_event(event);
     
@@ -58,35 +63,50 @@ bool Connection::connect(const char* addr, uint16_t port, int timeout_ms) {
     if (rdma_resolve_route(cm_id_, timeout_ms)) {
         rdma_destroy_id(cm_id_);
         rdma_destroy_event_channel(channel);
-        return false;
+        cm_id_ = nullptr;
+        return ErrorCode::CONNECT_FAILED;
     }
     
     // 等待路由解析完成
     if (rdma_get_cm_event(channel, &event)) {
         rdma_destroy_id(cm_id_);
         rdma_destroy_event_channel(channel);
-        return false;
+        cm_id_ = nullptr;
+        return ErrorCode::CONNECT_FAILED;
     }
     
     if (event->event != RDMA_CM_EVENT_ROUTE_RESOLVED) {
         rdma_ack_cm_event(event);
         rdma_destroy_id(cm_id_);
         rdma_destroy_event_channel(channel);
-        return false;
+        cm_id_ = nullptr;
+        return ErrorCode::CONNECT_FAILED;
     }
     rdma_ack_cm_event(event);
     
     // 创建QP并转换状态
-    if (!setupQP()) {
+    ErrorCode err = setupQP();
+    if (err != ErrorCode::OK) {
         rdma_destroy_id(cm_id_);
         rdma_destroy_event_channel(channel);
-        return false;
+        cm_id_ = nullptr;
+        return err;
     }
     
-    if (!transitionToInit() || !transitionToRTR()) {
+    err = transitionToInit();
+    if (err != ErrorCode::OK) {
         rdma_destroy_id(cm_id_);
         rdma_destroy_event_channel(channel);
-        return false;
+        cm_id_ = nullptr;
+        return err;
+    }
+    
+    err = transitionToRTR();
+    if (err != ErrorCode::OK) {
+        rdma_destroy_id(cm_id_);
+        rdma_destroy_event_channel(channel);
+        cm_id_ = nullptr;
+        return err;
     }
     
     // 发起连接
@@ -99,49 +119,63 @@ bool Connection::connect(const char* addr, uint16_t port, int timeout_ms) {
     if (rdma_connect(cm_id_, &conn_param)) {
         rdma_destroy_id(cm_id_);
         rdma_destroy_event_channel(channel);
-        return false;
+        cm_id_ = nullptr;
+        return ErrorCode::CONNECT_FAILED;
     }
     
     // 等待连接建立
     if (rdma_get_cm_event(channel, &event)) {
         rdma_destroy_id(cm_id_);
         rdma_destroy_event_channel(channel);
-        return false;
+        cm_id_ = nullptr;
+        return ErrorCode::CONNECT_FAILED;
     }
     
     if (event->event != RDMA_CM_EVENT_ESTABLISHED) {
         rdma_ack_cm_event(event);
         rdma_destroy_id(cm_id_);
         rdma_destroy_event_channel(channel);
-        return false;
+        cm_id_ = nullptr;
+        return ErrorCode::CONNECT_FAILED;
     }
     
     rdma_ack_cm_event(event);
     rdma_destroy_event_channel(channel);
     
     // 转换到RTS状态
-    if (!transitionToRTS()) {
+    err = transitionToRTS();
+    if (err != ErrorCode::OK) {
         rdma_disconnect(cm_id_);
         rdma_destroy_id(cm_id_);
-        return false;
+        cm_id_ = nullptr;
+        return err;
     }
     
     connected_ = true;
     is_server_ = false;
-    return true;
+    return ErrorCode::OK;
 }
 
 // 服务端接受连接
-bool Connection::accept(rdma_cm_id* listener_id, int timeout_ms) {
+ErrorCode Connection::accept(rdma_cm_id* listener_id, int timeout_ms) {
+    if (!listener_id) return ErrorCode::INVALID_PARAM;
+    
     cm_id_ = listener_id;
     
     // 创建QP并转换状态
-    if (!setupQP()) {
-        return false;
+    ErrorCode err = setupQP();
+    if (err != ErrorCode::OK) {
+        return err;
     }
     
-    if (!transitionToInit() || !transitionToRTR()) {
-        return false;
+    err = transitionToInit();
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    
+    err = transitionToRTR();
+    if (err != ErrorCode::OK) {
+        return err;
     }
     
     // 接受连接
@@ -151,21 +185,22 @@ bool Connection::accept(rdma_cm_id* listener_id, int timeout_ms) {
     conn_param.responder_resources = 1;
     
     if (rdma_accept(cm_id_, &conn_param)) {
-        return false;
+        return ErrorCode::CONNECT_FAILED;
     }
     
     // 转换到RTS状态
-    if (!transitionToRTS()) {
+    err = transitionToRTS();
+    if (err != ErrorCode::OK) {
         rdma_reject(cm_id_, nullptr, 0);
-        return false;
+        return err;
     }
     
     connected_ = true;
     is_server_ = true;
-    return true;
+    return ErrorCode::OK;
 }
 
-// 关闭连接：断开连接、销毁QP和cm_id
+// 关闭连接
 void Connection::close() {
     if (connected_) {
         rdma_disconnect(cm_id_);
@@ -175,14 +210,14 @@ void Connection::close() {
         ibv_destroy_qp(qp_);
         qp_ = nullptr;
     }
-    if (cm_id_) {
+    if (cm_id_ && !is_server_) {
         rdma_destroy_id(cm_id_);
         cm_id_ = nullptr;
     }
 }
 
 // 创建QP
-bool Connection::setupQP() {
+ErrorCode Connection::setupQP() {
     ibv_qp_init_attr attr;
     std::memset(&attr, 0, sizeof(attr));
     attr.send_cq = transport_.cq();
@@ -194,14 +229,16 @@ bool Connection::setupQP() {
     attr.qp_type = IBV_QPT_RC;
     
     if (rdma_create_qp(cm_id_, transport_.pd(), &attr) != 0) {
-        return false;
+        return ErrorCode::CREATE_FAILED;
     }
     qp_ = cm_id_->qp;
-    return true;
+    return ErrorCode::OK;
 }
 
 // QP状态转换: RESET -> INIT
-bool Connection::transitionToInit() {
+ErrorCode Connection::transitionToInit() {
+    if (!qp_) return ErrorCode::QP_STATE_ERROR;
+    
     ibv_qp_attr attr;
     std::memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_INIT;
@@ -209,12 +246,17 @@ bool Connection::transitionToInit() {
     attr.port_num = 1;
     attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
     
-    return ibv_modify_qp(qp_, &attr, 
-                         IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) == 0;
+    if (ibv_modify_qp(qp_, &attr, 
+                      IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) != 0) {
+        return ErrorCode::QP_STATE_ERROR;
+    }
+    return ErrorCode::OK;
 }
 
-// QP状态转换: INIT -> RTR (Ready to Receive)
-bool Connection::transitionToRTR() {
+// QP状态转换: INIT -> RTR
+ErrorCode Connection::transitionToRTR() {
+    if (!qp_ || !cm_id_->qp) return ErrorCode::QP_STATE_ERROR;
+    
     ibv_qp_attr attr;
     std::memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RTR;
@@ -232,13 +274,18 @@ bool Connection::transitionToRTR() {
     remote_qpn_ = attr.dest_qp_num;
     remote_lid_ = attr.ah_attr.dlid;
     
-    return ibv_modify_qp(qp_, &attr,
-                         IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
-                         IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER) == 0;
+    if (ibv_modify_qp(qp_, &attr,
+                      IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+                      IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER) != 0) {
+        return ErrorCode::QP_STATE_ERROR;
+    }
+    return ErrorCode::OK;
 }
 
-// QP状态转换: RTR -> RTS (Ready to Send)
-bool Connection::transitionToRTS() {
+// QP状态转换: RTR -> RTS
+ErrorCode Connection::transitionToRTS() {
+    if (!qp_) return ErrorCode::QP_STATE_ERROR;
+    
     ibv_qp_attr attr;
     std::memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RTS;
@@ -248,9 +295,12 @@ bool Connection::transitionToRTS() {
     attr.rnr_retry = DEFAULT_RETRY_COUNT;
     attr.max_rd_atomic = 1;
     
-    return ibv_modify_qp(qp_, &attr,
-                         IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
-                         IBV_QP_RNR_RETRY | IBV_QP_MAX_QP_RD_ATOMIC) == 0;
+    if (ibv_modify_qp(qp_, &attr,
+                      IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+                      IBV_QP_RNR_RETRY | IBV_QP_MAX_QP_RD_ATOMIC) != 0) {
+        return ErrorCode::QP_STATE_ERROR;
+    }
+    return ErrorCode::OK;
 }
 
 // 获取发送缓冲区
@@ -269,32 +319,35 @@ void Connection::returnBuffer(Buffer& buf) {
 }
 
 // 发送数据
-int Connection::send(const Buffer& buf, size_t len, uint64_t wr_id, bool inline_flag) {
+ErrorCode Connection::send(const Buffer& buf, size_t len, uint64_t wr_id, bool inline_flag) {
     return Transport::postSend(qp_, buf, len, wr_id, inline_flag);
 }
 
 // 发送带立即数的数据
-int Connection::sendImm(const Buffer& buf, size_t len, uint64_t wr_id, uint32_t imm_data) {
+ErrorCode Connection::sendImm(const Buffer& buf, size_t len, uint64_t wr_id, uint32_t imm_data) {
     return Transport::postSendImm(qp_, buf, len, wr_id, imm_data);
 }
 
 // 投递接收缓冲区
-int Connection::recv(const Buffer& buf, uint64_t wr_id) {
+ErrorCode Connection::recv(const Buffer& buf, uint64_t wr_id) {
     return Transport::postRecv(qp_, buf, wr_id);
 }
 
 // RDMA Write
-int Connection::write(const Buffer& buf, size_t len, uint64_t wr_id, bool inline_flag) {
+ErrorCode Connection::write(const Buffer& buf, size_t len, uint64_t wr_id, bool inline_flag) {
+    if (remote_rkey_ == 0) return ErrorCode::INVALID_PARAM;
     return Transport::postWrite(qp_, buf, len, wr_id, remote_rkey_, remote_addr_, inline_flag);
 }
 
 // RDMA Write with Immediate
-int Connection::writeImm(const Buffer& buf, size_t len, uint64_t wr_id, uint32_t imm_data) {
+ErrorCode Connection::writeImm(const Buffer& buf, size_t len, uint64_t wr_id, uint32_t imm_data) {
+    if (remote_rkey_ == 0) return ErrorCode::INVALID_PARAM;
     return Transport::postWriteImm(qp_, buf, len, wr_id, remote_rkey_, remote_addr_, imm_data);
 }
 
 // RDMA Read
-int Connection::read(const Buffer& buf, size_t len, uint64_t wr_id) {
+ErrorCode Connection::read(const Buffer& buf, size_t len, uint64_t wr_id) {
+    if (remote_rkey_ == 0) return ErrorCode::INVALID_PARAM;
     return Transport::postRead(qp_, buf, len, wr_id, remote_rkey_, remote_addr_);
 }
 

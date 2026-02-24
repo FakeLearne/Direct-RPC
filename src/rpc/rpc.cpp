@@ -19,17 +19,18 @@ void RpcServer::registerHandler(uint32_t func_id, RpcHandler handler) {
 }
 
 // 启动服务：初始化传输层、绑定地址、开始监听
-bool RpcServer::start() {
-    if (!transport_.init()) return false;
+ErrorCode RpcServer::start() {
+    ErrorCode err = transport_.init();
+    if (err != ErrorCode::OK) return err;
     
     // 创建事件通道
     rdma_event_channel* channel = rdma_create_event_channel();
-    if (!channel) return false;
+    if (!channel) return ErrorCode::CREATE_FAILED;
     
     // 创建监听cm_id
     if (rdma_create_id(channel, &listen_id_, nullptr, RDMA_PS_TCP)) {
         rdma_destroy_event_channel(channel);
-        return false;
+        return ErrorCode::CREATE_FAILED;
     }
     
     // 绑定地址
@@ -42,18 +43,20 @@ bool RpcServer::start() {
     if (rdma_bind_addr(listen_id_, (sockaddr*)&server_addr)) {
         rdma_destroy_id(listen_id_);
         rdma_destroy_event_channel(channel);
-        return false;
+        listen_id_ = nullptr;
+        return ErrorCode::CREATE_FAILED;
     }
     
     // 开始监听
     if (rdma_listen(listen_id_, 10)) {
         rdma_destroy_id(listen_id_);
         rdma_destroy_event_channel(channel);
-        return false;
+        listen_id_ = nullptr;
+        return ErrorCode::CREATE_FAILED;
     }
     
     running_ = true;
-    return true;
+    return ErrorCode::OK;
 }
 
 // 停止服务
@@ -67,6 +70,8 @@ void RpcServer::stop() {
 
 // 运行事件循环，接受连接并处理请求
 void RpcServer::run() {
+    if (!listen_id_ || !listen_id_->channel) return;
+    
     rdma_event_channel* channel = listen_id_->channel;
     
     while (running_) {
@@ -83,7 +88,8 @@ void RpcServer::run() {
         // 处理连接请求
         if (event->event == RDMA_CM_EVENT_CONNECT_REQUEST) {
             Connection conn(transport_);
-            if (conn.accept(event->id, DEFAULT_TIMEOUT_MS)) {
+            ErrorCode err = conn.accept(event->id, DEFAULT_TIMEOUT_MS);
+            if (err == ErrorCode::OK) {
                 handleClient(conn);
             }
         }
@@ -99,12 +105,13 @@ void RpcServer::handleClient(Connection& conn) {
     
     while (running_ && conn.connected()) {
         // 投递接收缓冲区
-        if (conn.recv(recv_buf, 1) != 0) break;
+        ErrorCode err = conn.recv(recv_buf, 1);
+        if (err != ErrorCode::OK) break;
         
         // 等待接收完成
         ibv_wc wc;
-        if (transport_.pollCompletion(wc, DEFAULT_TIMEOUT_MS) <= 0) break;
-        if (wc.status != IBV_WC_SUCCESS) break;
+        err = transport_.pollCompletion(wc, DEFAULT_TIMEOUT_MS);
+        if (err != ErrorCode::OK) break;
         
         // 解析消息头
         MsgHeader* hdr = getMsgHeader(recv_buf.addr);
@@ -132,7 +139,11 @@ void RpcServer::processRequest(Connection& conn, const MsgHeader* hdr) {
     if (!send_buf.valid()) return;
     
     bool use_inline = resp_len <= SMALL_MSG_THRESHOLD;
-    conn.send(send_buf, MSG_HEADER_SIZE + resp_len, 1, use_inline);
+    ErrorCode err = conn.send(send_buf, MSG_HEADER_SIZE + resp_len, 1, use_inline);
+    if (err != ErrorCode::OK) {
+        transport_.pool().deallocate(send_buf);
+        return;
+    }
     
     // 等待发送完成
     ibv_wc wc;
@@ -149,11 +160,19 @@ RpcClient::~RpcClient() {
 }
 
 // 连接服务端
-bool RpcClient::connect(const char* addr, uint16_t port, int timeout_ms) {
-    if (!transport_.init()) return false;
+ErrorCode RpcClient::connect(const char* addr, uint16_t port, int timeout_ms) {
+    if (!addr) return ErrorCode::INVALID_PARAM;
+    
+    ErrorCode err = transport_.init();
+    if (err != ErrorCode::OK) return err;
     
     conn_ = std::make_unique<Connection>(transport_);
-    return conn_->connect(addr, port, timeout_ms);
+    err = conn_->connect(addr, port, timeout_ms);
+    if (err != ErrorCode::OK) {
+        conn_.reset();
+        return err;
+    }
+    return ErrorCode::OK;
 }
 
 // 断开连接
@@ -164,44 +183,48 @@ void RpcClient::disconnect() {
     }
 }
 
-// 同步RPC调用
-bool RpcClient::call(uint32_t func_id, const void* req, size_t req_len,
-                     void* resp, size_t& resp_len, int timeout_ms) {
-    if (!connected()) return false;
+// 同步RPC调用（Push模式）
+ErrorCode RpcClient::call(uint32_t func_id, const void* req, size_t req_len,
+                         void* resp, size_t& resp_len, int timeout_ms) {
+    if (!connected()) return ErrorCode::DISCONNECTED;
+    if (!req && req_len > 0) return ErrorCode::INVALID_PARAM;
     
     uint32_t seq_id = next_seq_id_.fetch_add(1);
     
     // 编码请求
     Buffer send_buf = encodeRequest(transport_.pool(), seq_id, func_id, req, req_len);
-    if (!send_buf.valid()) return false;
+    if (!send_buf.valid()) return ErrorCode::NO_MEMORY;
     
     // 分配接收缓冲区
     Buffer recv_buf = transport_.pool().allocate(4096);
     if (!recv_buf.valid()) {
         transport_.pool().deallocate(send_buf);
-        return false;
+        return ErrorCode::NO_MEMORY;
     }
     
     // 投递接收缓冲区
-    if (conn_->recv(recv_buf, 2) != 0) {
+    ErrorCode err = conn_->recv(recv_buf, 2);
+    if (err != ErrorCode::OK) {
         transport_.pool().deallocate(send_buf);
         transport_.pool().deallocate(recv_buf);
-        return false;
+        return err;
     }
     
     // 发送请求
     bool use_inline = (MSG_HEADER_SIZE + req_len) <= SMALL_MSG_THRESHOLD;
-    if (conn_->send(send_buf, MSG_HEADER_SIZE + req_len, 1, use_inline) != 0) {
+    err = conn_->send(send_buf, MSG_HEADER_SIZE + req_len, 1, use_inline);
+    if (err != ErrorCode::OK) {
         transport_.pool().deallocate(send_buf);
         transport_.pool().deallocate(recv_buf);
-        return false;
+        return err;
     }
     
     // 等待响应
-    if (!waitForResponse(seq_id, recv_buf, timeout_ms)) {
+    err = waitForResponse(seq_id, recv_buf, timeout_ms);
+    if (err != ErrorCode::OK) {
         transport_.pool().deallocate(send_buf);
         transport_.pool().deallocate(recv_buf);
-        return false;
+        return err;
     }
     
     // 解析响应
@@ -209,33 +232,154 @@ bool RpcClient::call(uint32_t func_id, const void* req, size_t req_len,
     if (!validateHeader(hdr) || hdr->type != MSG_RESPONSE) {
         transport_.pool().deallocate(send_buf);
         transport_.pool().deallocate(recv_buf);
-        return false;
+        return ErrorCode::ERROR;
     }
     
     // 拷贝响应数据
     size_t copy_len = std::min(resp_len, (size_t)hdr->payload_len);
-    std::memcpy(resp, getMsgPayload(recv_buf.addr), copy_len);
+    if (resp && resp_len > 0) {
+        std::memcpy(resp, getMsgPayload(recv_buf.addr), copy_len);
+    }
     resp_len = copy_len;
     
     transport_.pool().deallocate(send_buf);
     transport_.pool().deallocate(recv_buf);
-    return true;
+    return ErrorCode::OK;
 }
 
-// 等待响应，检查序列号匹配
-bool RpcClient::waitForResponse(uint32_t seq_id, Buffer& recv_buf, int timeout_ms) {
+// Pull模式RPC调用
+ErrorCode RpcClient::callWithPull(uint32_t func_id, const void* req, size_t req_len,
+                                  void* resp, size_t& resp_len, int timeout_ms) {
+    if (!connected()) return ErrorCode::DISCONNECTED;
+    
+    // Pull模式流程：
+    // 1. Client发送请求
+    // 2. Server处理请求，将结果放入预注册内存
+    // 3. Server发送DATA_READY消息（包含addr+rkey）
+    // 4. Client使用RDMA Read拉取数据
+    
+    uint32_t seq_id = next_seq_id_.fetch_add(1);
+    
+    // 编码请求（标记Pull模式）
+    Buffer send_buf = encodeRequest(transport_.pool(), seq_id, func_id, req, req_len);
+    if (!send_buf.valid()) return ErrorCode::NO_MEMORY;
+    
+    // 分配接收缓冲区（用于接收DATA_READY）
+    Buffer recv_buf = transport_.pool().allocate(4096);
+    if (!recv_buf.valid()) {
+        transport_.pool().deallocate(send_buf);
+        return ErrorCode::NO_MEMORY;
+    }
+    
+    // 分配数据缓冲区（用于RDMA Read）
+    Buffer data_buf = transport_.pool().allocate(65536);
+    if (!data_buf.valid()) {
+        transport_.pool().deallocate(send_buf);
+        transport_.pool().deallocate(recv_buf);
+        return ErrorCode::NO_MEMORY;
+    }
+    
+    // 投递接收缓冲区
+    ErrorCode err = conn_->recv(recv_buf, 2);
+    if (err != ErrorCode::OK) {
+        transport_.pool().deallocate(send_buf);
+        transport_.pool().deallocate(recv_buf);
+        transport_.pool().deallocate(data_buf);
+        return err;
+    }
+    
+    // 发送请求（告诉Server我们的数据缓冲区地址）
+    // 在Pull模式下，我们需要先告诉Server我们的缓冲区信息
+    conn_->setRemoteInfo(data_buf.rkey, (uint64_t)data_buf.addr);
+    
+    bool use_inline = (MSG_HEADER_SIZE + req_len) <= SMALL_MSG_THRESHOLD;
+    err = conn_->send(send_buf, MSG_HEADER_SIZE + req_len, 1, use_inline);
+    if (err != ErrorCode::OK) {
+        transport_.pool().deallocate(send_buf);
+        transport_.pool().deallocate(recv_buf);
+        transport_.pool().deallocate(data_buf);
+        return err;
+    }
+    
+    // 等待响应
+    err = waitForResponse(seq_id, recv_buf, timeout_ms);
+    if (err != ErrorCode::OK) {
+        transport_.pool().deallocate(send_buf);
+        transport_.pool().deallocate(recv_buf);
+        transport_.pool().deallocate(data_buf);
+        return err;
+    }
+    
+    // 解析响应
+    MsgHeader* hdr = getMsgHeader(recv_buf.addr);
+    if (!validateHeader(hdr)) {
+        transport_.pool().deallocate(send_buf);
+        transport_.pool().deallocate(recv_buf);
+        transport_.pool().deallocate(data_buf);
+        return ErrorCode::ERROR;
+    }
+    
+    // 如果是DATA_READY消息，使用RDMA Read拉取数据
+    if (hdr->type == MSG_DATA_READY) {
+        DataReadyMsg* info = (DataReadyMsg*)getMsgPayload(recv_buf.addr);
+        
+        // 使用RDMA Read拉取数据
+        err = conn_->read(data_buf, info->data_len, 3);
+        if (err != ErrorCode::OK) {
+            transport_.pool().deallocate(send_buf);
+            transport_.pool().deallocate(recv_buf);
+            transport_.pool().deallocate(data_buf);
+            return err;
+        }
+        
+        // 等待RDMA Read完成
+        ibv_wc wc;
+        err = transport_.pollCompletion(wc, timeout_ms);
+        if (err != ErrorCode::OK) {
+            transport_.pool().deallocate(send_buf);
+            transport_.pool().deallocate(recv_buf);
+            transport_.pool().deallocate(data_buf);
+            return err;
+        }
+        
+        // 拷贝数据
+        size_t copy_len = std::min(resp_len, (size_t)info->data_len);
+        if (resp && resp_len > 0) {
+            std::memcpy(resp, data_buf.addr, copy_len);
+        }
+        resp_len = copy_len;
+    } else if (hdr->type == MSG_RESPONSE) {
+        // 如果是普通响应，直接拷贝
+        size_t copy_len = std::min(resp_len, (size_t)hdr->payload_len);
+        if (resp && resp_len > 0) {
+            std::memcpy(resp, getMsgPayload(recv_buf.addr), copy_len);
+        }
+        resp_len = copy_len;
+    } else {
+        transport_.pool().deallocate(send_buf);
+        transport_.pool().deallocate(recv_buf);
+        transport_.pool().deallocate(data_buf);
+        return ErrorCode::ERROR;
+    }
+    
+    transport_.pool().deallocate(send_buf);
+    transport_.pool().deallocate(recv_buf);
+    transport_.pool().deallocate(data_buf);
+    return ErrorCode::OK;
+}
+
+// 等待响应
+ErrorCode RpcClient::waitForResponse(uint32_t seq_id, Buffer& recv_buf, int timeout_ms) {
     auto start = std::chrono::steady_clock::now();
     
     while (true) {
         ibv_wc wc;
-        int ret = transport_.pollCompletion(wc, 10);
+        ErrorCode err = transport_.pollCompletion(wc, 10);
         
-        if (ret > 0 && wc.status == IBV_WC_SUCCESS) {
-            if (wc.wr_id == 2) {  // recv wr_id
-                MsgHeader* hdr = getMsgHeader(recv_buf.addr);
-                if (hdr->seq_id == seq_id) {
-                    return true;
-                }
+        if (err == ErrorCode::OK && wc.wr_id == 2) {  // recv wr_id
+            MsgHeader* hdr = getMsgHeader(recv_buf.addr);
+            if (hdr->seq_id == seq_id) {
+                return ErrorCode::OK;
             }
         }
         
@@ -243,9 +387,15 @@ bool RpcClient::waitForResponse(uint32_t seq_id, Buffer& recv_buf, int timeout_m
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start);
         if (elapsed.count() >= timeout_ms) {
-            return false;
+            return ErrorCode::TIMEOUT;
         }
     }
+}
+
+// 等待发送完成
+ErrorCode RpcClient::waitForSendComplete(int timeout_ms) {
+    ibv_wc wc;
+    return transport_.pollCompletion(wc, timeout_ms);
 }
 
 }

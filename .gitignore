@@ -38,3 +38,5 @@ callgrind.out.*
 
 .clangd/
 .cache/
+
+improvement_suggestions.md

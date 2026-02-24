@@ -6,8 +6,6 @@
 
 namespace drpc {
 
-class RdmaContext;
-
 // 内存池，管理预注册的RDMA内存
 class MemoryPool {
 public:

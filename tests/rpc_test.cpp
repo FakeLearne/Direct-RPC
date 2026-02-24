@@ -14,7 +14,7 @@ int main() {
         resp_len = len;
     });
     
-    if (!server.start()) {
+    if (!drpc::is_ok(server.start())) {
         std::cerr << "Failed to start server" << std::endl;
         return 1;
     }
