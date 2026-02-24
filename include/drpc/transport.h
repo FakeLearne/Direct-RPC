@@ -73,6 +73,8 @@ public:
     Buffer getSendBuffer();             // 获取发送缓冲区
     Buffer getRecvBuffer();             // 获取接收缓冲区
     void returnBuffer(Buffer& buf);     // 归还缓冲区
+    MemoryPool& pool();                 // 获取内存池引用
+    ErrorCode pollCompletion(ibv_wc& wc, int timeout_ms = 0);  // 轮询完成事件
 
     ErrorCode send(const Buffer& buf, size_t len, uint64_t wr_id, bool inline_flag = false);  // 发送数据
     ErrorCode sendImm(const Buffer& buf, size_t len, uint64_t wr_id, uint32_t imm_data);      // 发送带立即数
@@ -86,12 +88,18 @@ private:
     ErrorCode transitionToInit();        // QP状态转换: -> INIT
     ErrorCode transitionToRTR();         // QP状态转换: INIT -> RTR
     ErrorCode transitionToRTS();         // QP状态转换: RTR -> RTS
+    ErrorCode createClientResources();   // 为客户端创建PD、CQ、内存池
 
-    Transport& transport_;              // 传输层引用
+    Transport& transport_;              // 传输层引用（服务端使用）
     rdma_cm_id* cm_id_ = nullptr;       // rdma_cm连接ID
     ibv_qp* qp_ = nullptr;              // 队列对
     bool connected_ = false;            // 连接状态
     bool is_server_ = false;            // 是否为服务端
+
+    // 客户端专用资源（在rdma_cm确定设备后创建）
+    ibv_pd* client_pd_ = nullptr;       // 客户端保护域
+    ibv_cq* client_cq_ = nullptr;       // 客户端完成队列
+    std::unique_ptr<MemoryPool> client_pool_;  // 客户端内存池
 
     uint32_t remote_rkey_ = 0;          // 远端rkey
     uint64_t remote_addr_ = 0;          // 远端地址

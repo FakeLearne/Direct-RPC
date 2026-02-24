@@ -5,7 +5,7 @@
 int main() {
     drpc::RpcClient client;
     
-    if (!drpc::is_ok(client.connect("127.0.0.1", 12345))) {
+    if (!drpc::is_ok(client.connect("192.168.100.2", 12345))) {
         std::cerr << "Failed to connect to server" << std::endl;
         return 1;
     }

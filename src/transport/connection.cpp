@@ -1,7 +1,9 @@
 #include <drpc/transport.h>
 #include <cstring>
+#include <cerrno>
 #include <arpa/inet.h>
 #include <rdma/rdma_cma.h>
+#include <poll.h>
 
 namespace drpc {
 
@@ -12,21 +14,46 @@ Connection::~Connection() {
     close();
 }
 
+// 为客户端创建资源（使用rdma_cm确定的设备）
+ErrorCode Connection::createClientResources() {
+    if (!cm_id_ || !cm_id_->verbs) {
+        return ErrorCode::CREATE_FAILED;
+    }
+    
+    // 使用 cm_id->verbs 创建 PD
+    client_pd_ = ibv_alloc_pd(cm_id_->verbs);
+    if (!client_pd_) {
+        fprintf(stderr, "[createClientResources] ibv_alloc_pd failed: %s\n", strerror(errno));
+        return ErrorCode::CREATE_FAILED;
+    }
+    
+    // 使用 cm_id->verbs 创建 CQ
+    client_cq_ = ibv_create_cq(cm_id_->verbs, DEFAULT_CQ_SIZE, nullptr, nullptr, 0);
+    if (!client_cq_) {
+        fprintf(stderr, "[createClientResources] ibv_create_cq failed: %s\n", strerror(errno));
+        ibv_dealloc_pd(client_pd_);
+        client_pd_ = nullptr;
+        return ErrorCode::CREATE_FAILED;
+    }
+    
+    // 创建客户端内存池
+    client_pool_ = std::make_unique<MemoryPool>(client_pd_);
+    
+    return ErrorCode::OK;
+}
+
 // 客户端连接：通过rdma_cm建立RDMA连接
 ErrorCode Connection::connect(const char* addr, uint16_t port, int timeout_ms) {
     if (!addr) return ErrorCode::INVALID_PARAM;
     
-    // 创建事件通道
     rdma_event_channel* channel = rdma_create_event_channel();
     if (!channel) return ErrorCode::CREATE_FAILED;
     
-    // 创建cm_id
     if (rdma_create_id(channel, &cm_id_, nullptr, RDMA_PS_TCP)) {
         rdma_destroy_event_channel(channel);
         return ErrorCode::CREATE_FAILED;
     }
     
-    // 解析服务器地址
     struct sockaddr_in server_addr;
     std::memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
@@ -41,7 +68,6 @@ ErrorCode Connection::connect(const char* addr, uint16_t port, int timeout_ms) {
         return ErrorCode::CONNECT_FAILED;
     }
     
-    // 等待地址解析完成
     rdma_cm_event* event = nullptr;
     if (rdma_get_cm_event(channel, &event)) {
         rdma_destroy_id(cm_id_);
@@ -67,7 +93,6 @@ ErrorCode Connection::connect(const char* addr, uint16_t port, int timeout_ms) {
         return ErrorCode::CONNECT_FAILED;
     }
     
-    // 等待路由解析完成
     if (rdma_get_cm_event(channel, &event)) {
         rdma_destroy_id(cm_id_);
         rdma_destroy_event_channel(channel);
@@ -84,9 +109,21 @@ ErrorCode Connection::connect(const char* addr, uint16_t port, int timeout_ms) {
     }
     rdma_ack_cm_event(event);
     
-    // 创建QP并转换状态
-    ErrorCode err = setupQP();
+    // 创建客户端资源（使用 rdma_cm 确定的设备）
+    ErrorCode err = createClientResources();
     if (err != ErrorCode::OK) {
+        rdma_destroy_id(cm_id_);
+        rdma_destroy_event_channel(channel);
+        cm_id_ = nullptr;
+        return err;
+    }
+    
+    // 创建QP
+    err = setupQP();
+    if (err != ErrorCode::OK) {
+        client_pool_.reset();
+        if (client_cq_) { ibv_destroy_cq(client_cq_); client_cq_ = nullptr; }
+        if (client_pd_) { ibv_dealloc_pd(client_pd_); client_pd_ = nullptr; }
         rdma_destroy_id(cm_id_);
         rdma_destroy_event_channel(channel);
         cm_id_ = nullptr;
@@ -95,18 +132,12 @@ ErrorCode Connection::connect(const char* addr, uint16_t port, int timeout_ms) {
     
     err = transitionToInit();
     if (err != ErrorCode::OK) {
-        rdma_destroy_id(cm_id_);
-        rdma_destroy_event_channel(channel);
-        cm_id_ = nullptr;
-        return err;
+        goto cleanup;
     }
     
     err = transitionToRTR();
     if (err != ErrorCode::OK) {
-        rdma_destroy_id(cm_id_);
-        rdma_destroy_event_channel(channel);
-        cm_id_ = nullptr;
-        return err;
+        goto cleanup;
     }
     
     // 发起连接
@@ -117,26 +148,20 @@ ErrorCode Connection::connect(const char* addr, uint16_t port, int timeout_ms) {
     conn_param.retry_count = DEFAULT_RETRY_COUNT;
     
     if (rdma_connect(cm_id_, &conn_param)) {
-        rdma_destroy_id(cm_id_);
-        rdma_destroy_event_channel(channel);
-        cm_id_ = nullptr;
-        return ErrorCode::CONNECT_FAILED;
+        err = ErrorCode::CONNECT_FAILED;
+        goto cleanup;
     }
     
     // 等待连接建立
     if (rdma_get_cm_event(channel, &event)) {
-        rdma_destroy_id(cm_id_);
-        rdma_destroy_event_channel(channel);
-        cm_id_ = nullptr;
-        return ErrorCode::CONNECT_FAILED;
+        err = ErrorCode::CONNECT_FAILED;
+        goto cleanup;
     }
     
     if (event->event != RDMA_CM_EVENT_ESTABLISHED) {
         rdma_ack_cm_event(event);
-        rdma_destroy_id(cm_id_);
-        rdma_destroy_event_channel(channel);
-        cm_id_ = nullptr;
-        return ErrorCode::CONNECT_FAILED;
+        err = ErrorCode::CONNECT_FAILED;
+        goto cleanup;
     }
     
     rdma_ack_cm_event(event);
@@ -146,14 +171,22 @@ ErrorCode Connection::connect(const char* addr, uint16_t port, int timeout_ms) {
     err = transitionToRTS();
     if (err != ErrorCode::OK) {
         rdma_disconnect(cm_id_);
-        rdma_destroy_id(cm_id_);
-        cm_id_ = nullptr;
-        return err;
+        goto cleanup;
     }
     
     connected_ = true;
     is_server_ = false;
     return ErrorCode::OK;
+
+cleanup:
+    if (qp_) { ibv_destroy_qp(qp_); qp_ = nullptr; }
+    client_pool_.reset();
+    if (client_cq_) { ibv_destroy_cq(client_cq_); client_cq_ = nullptr; }
+    if (client_pd_) { ibv_dealloc_pd(client_pd_); client_pd_ = nullptr; }
+    rdma_destroy_id(cm_id_);
+    rdma_destroy_event_channel(channel);
+    cm_id_ = nullptr;
+    return err;
 }
 
 // 服务端接受连接
@@ -161,8 +194,8 @@ ErrorCode Connection::accept(rdma_cm_id* listener_id, int timeout_ms) {
     if (!listener_id) return ErrorCode::INVALID_PARAM;
     
     cm_id_ = listener_id;
+    is_server_ = true;
     
-    // 创建QP并转换状态
     ErrorCode err = setupQP();
     if (err != ErrorCode::OK) {
         return err;
@@ -178,7 +211,6 @@ ErrorCode Connection::accept(rdma_cm_id* listener_id, int timeout_ms) {
         return err;
     }
     
-    // 接受连接
     rdma_conn_param conn_param;
     std::memset(&conn_param, 0, sizeof(conn_param));
     conn_param.initiator_depth = 1;
@@ -188,7 +220,6 @@ ErrorCode Connection::accept(rdma_cm_id* listener_id, int timeout_ms) {
         return ErrorCode::CONNECT_FAILED;
     }
     
-    // 转换到RTS状态
     err = transitionToRTS();
     if (err != ErrorCode::OK) {
         rdma_reject(cm_id_, nullptr, 0);
@@ -196,7 +227,6 @@ ErrorCode Connection::accept(rdma_cm_id* listener_id, int timeout_ms) {
     }
     
     connected_ = true;
-    is_server_ = true;
     return ErrorCode::OK;
 }
 
@@ -210,25 +240,48 @@ void Connection::close() {
         ibv_destroy_qp(qp_);
         qp_ = nullptr;
     }
-    if (cm_id_ && !is_server_) {
-        rdma_destroy_id(cm_id_);
-        cm_id_ = nullptr;
+    
+    // 客户端需要清理自己的资源
+    if (!is_server_) {
+        client_pool_.reset();
+        if (client_cq_) {
+            ibv_destroy_cq(client_cq_);
+            client_cq_ = nullptr;
+        }
+        if (client_pd_) {
+            ibv_dealloc_pd(client_pd_);
+            client_pd_ = nullptr;
+        }
+        if (cm_id_) {
+            rdma_destroy_id(cm_id_);
+            cm_id_ = nullptr;
+        }
     }
 }
 
 // 创建QP
 ErrorCode Connection::setupQP() {
+    ibv_pd* pd = is_server_ ? transport_.pd() : client_pd_;
+    ibv_cq* cq = is_server_ ? transport_.cq() : client_cq_;
+    
+    if (!pd || !cq || !cm_id_) {
+        fprintf(stderr, "[setupQP] ERROR: pd=%p cq=%p cm_id=%p\n", pd, cq, cm_id_);
+        return ErrorCode::CREATE_FAILED;
+    }
+    
     ibv_qp_init_attr attr;
     std::memset(&attr, 0, sizeof(attr));
-    attr.send_cq = transport_.cq();
-    attr.recv_cq = transport_.cq();
     attr.cap.max_send_wr = DEFAULT_QP_DEPTH;
     attr.cap.max_recv_wr = DEFAULT_QP_DEPTH;
     attr.cap.max_send_sge = 1;
     attr.cap.max_recv_sge = 1;
     attr.qp_type = IBV_QPT_RC;
+    attr.sq_sig_all = 1;
+    attr.send_cq = cq;
+    attr.recv_cq = cq;
     
-    if (rdma_create_qp(cm_id_, transport_.pd(), &attr) != 0) {
+    if (rdma_create_qp(cm_id_, pd, &attr) != 0) {
+        fprintf(stderr, "[setupQP] rdma_create_qp failed: %s\n", strerror(errno));
         return ErrorCode::CREATE_FAILED;
     }
     qp_ = cm_id_->qp;
@@ -303,19 +356,59 @@ ErrorCode Connection::transitionToRTS() {
     return ErrorCode::OK;
 }
 
+// 获取内存池引用
+MemoryPool& Connection::pool() {
+    if (is_server_) {
+        return transport_.pool();
+    }
+    return *client_pool_;
+}
+
+// 轮询完成事件
+ErrorCode Connection::pollCompletion(ibv_wc& wc, int timeout_ms) {
+    ibv_cq* cq = is_server_ ? transport_.cq() : client_cq_;
+    if (!cq) return ErrorCode::ERROR;
+    
+    if (timeout_ms > 0) {
+        struct pollfd pfd;
+        pfd.fd = cq->channel ? cq->channel->fd : -1;
+        pfd.events = POLLIN;
+        
+        if (poll(&pfd, 1, timeout_ms) <= 0) {
+            return ErrorCode::TIMEOUT;
+        }
+    }
+    
+    int ret = ibv_poll_cq(cq, 1, &wc);
+    if (ret < 0) return ErrorCode::POLL_ERROR;
+    if (ret == 0) return ErrorCode::TIMEOUT;
+    if (wc.status != IBV_WC_SUCCESS) return ErrorCode::ERROR;
+    return ErrorCode::OK;
+}
+
 // 获取发送缓冲区
 Buffer Connection::getSendBuffer() {
-    return transport_.pool().allocate(4096);
+    if (is_server_) {
+        return transport_.pool().allocate(4096);
+    }
+    return client_pool_->allocate(4096);
 }
 
 // 获取接收缓冲区
 Buffer Connection::getRecvBuffer() {
-    return transport_.pool().allocate(4096);
+    if (is_server_) {
+        return transport_.pool().allocate(4096);
+    }
+    return client_pool_->allocate(4096);
 }
 
 // 归还缓冲区
 void Connection::returnBuffer(Buffer& buf) {
-    transport_.pool().deallocate(buf);
+    if (is_server_) {
+        transport_.pool().deallocate(buf);
+    } else {
+        client_pool_->deallocate(buf);
+    }
 }
 
 // 发送数据
