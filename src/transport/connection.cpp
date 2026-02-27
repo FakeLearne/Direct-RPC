@@ -1,6 +1,8 @@
 #include <drpc/transport.h>
 #include <cstring>
 #include <cerrno>
+#include <chrono>
+#include <thread>
 #include <arpa/inet.h>
 #include <rdma/rdma_cma.h>
 #include <poll.h>
@@ -46,9 +48,11 @@ ErrorCode Connection::createClientResources() {
 ErrorCode Connection::connect(const char* addr, uint16_t port, int timeout_ms) {
     if (!addr) return ErrorCode::INVALID_PARAM;
     
+    fprintf(stderr, "[connect] Step 1: Creating event channel...\n");
     rdma_event_channel* channel = rdma_create_event_channel();
     if (!channel) return ErrorCode::CREATE_FAILED;
     
+    fprintf(stderr, "[connect] Step 2: Creating cm_id...\n");
     if (rdma_create_id(channel, &cm_id_, nullptr, RDMA_PS_TCP)) {
         rdma_destroy_event_channel(channel);
         return ErrorCode::CREATE_FAILED;
@@ -60,6 +64,7 @@ ErrorCode Connection::connect(const char* addr, uint16_t port, int timeout_ms) {
     server_addr.sin_port = htons(port);
     inet_pton(AF_INET, addr, &server_addr.sin_addr);
     
+    fprintf(stderr, "[connect] Step 3: Resolving address %s:%d...\n", addr, port);
     // 地址解析
     if (rdma_resolve_addr(cm_id_, nullptr, (sockaddr*)&server_addr, timeout_ms)) {
         rdma_destroy_id(cm_id_);
@@ -68,6 +73,7 @@ ErrorCode Connection::connect(const char* addr, uint16_t port, int timeout_ms) {
         return ErrorCode::CONNECT_FAILED;
     }
     
+    fprintf(stderr, "[connect] Step 4: Waiting for ADDR_RESOLVED...\n");
     rdma_cm_event* event = nullptr;
     if (rdma_get_cm_event(channel, &event)) {
         rdma_destroy_id(cm_id_);
@@ -77,6 +83,7 @@ ErrorCode Connection::connect(const char* addr, uint16_t port, int timeout_ms) {
     }
     
     if (event->event != RDMA_CM_EVENT_ADDR_RESOLVED) {
+        fprintf(stderr, "[connect] Unexpected event: %d\n", event->event);
         rdma_ack_cm_event(event);
         rdma_destroy_id(cm_id_);
         rdma_destroy_event_channel(channel);
@@ -84,6 +91,7 @@ ErrorCode Connection::connect(const char* addr, uint16_t port, int timeout_ms) {
         return ErrorCode::CONNECT_FAILED;
     }
     rdma_ack_cm_event(event);
+    fprintf(stderr, "[connect] Step 5: ADDR_RESOLVED, resolving route...\n");
     
     // 路由解析
     if (rdma_resolve_route(cm_id_, timeout_ms)) {
@@ -93,6 +101,7 @@ ErrorCode Connection::connect(const char* addr, uint16_t port, int timeout_ms) {
         return ErrorCode::CONNECT_FAILED;
     }
     
+    fprintf(stderr, "[connect] Step 6: Waiting for ROUTE_RESOLVED...\n");
     if (rdma_get_cm_event(channel, &event)) {
         rdma_destroy_id(cm_id_);
         rdma_destroy_event_channel(channel);
@@ -101,6 +110,7 @@ ErrorCode Connection::connect(const char* addr, uint16_t port, int timeout_ms) {
     }
     
     if (event->event != RDMA_CM_EVENT_ROUTE_RESOLVED) {
+        fprintf(stderr, "[connect] Unexpected event: %d\n", event->event);
         rdma_ack_cm_event(event);
         rdma_destroy_id(cm_id_);
         rdma_destroy_event_channel(channel);
@@ -108,6 +118,7 @@ ErrorCode Connection::connect(const char* addr, uint16_t port, int timeout_ms) {
         return ErrorCode::CONNECT_FAILED;
     }
     rdma_ack_cm_event(event);
+    fprintf(stderr, "[connect] Step 7: ROUTE_RESOLVED, creating resources...\n");
     
     // 创建客户端资源（使用 rdma_cm 确定的设备）
     ErrorCode err = createClientResources();
@@ -117,6 +128,7 @@ ErrorCode Connection::connect(const char* addr, uint16_t port, int timeout_ms) {
         cm_id_ = nullptr;
         return err;
     }
+    fprintf(stderr, "[connect] Step 8: Resources created, setting up QP...\n");
     
     // 创建QP
     err = setupQP();
@@ -129,18 +141,9 @@ ErrorCode Connection::connect(const char* addr, uint16_t port, int timeout_ms) {
         cm_id_ = nullptr;
         return err;
     }
+    fprintf(stderr, "[connect] Step 9: QP created, calling rdma_connect...\n");
     
-    err = transitionToInit();
-    if (err != ErrorCode::OK) {
-        goto cleanup;
-    }
-    
-    err = transitionToRTR();
-    if (err != ErrorCode::OK) {
-        goto cleanup;
-    }
-    
-    // 发起连接
+    // 发起连接（rdma_connect 会自动处理 QP 状态转换）
     rdma_conn_param conn_param;
     std::memset(&conn_param, 0, sizeof(conn_param));
     conn_param.initiator_depth = 1;
@@ -148,17 +151,22 @@ ErrorCode Connection::connect(const char* addr, uint16_t port, int timeout_ms) {
     conn_param.retry_count = DEFAULT_RETRY_COUNT;
     
     if (rdma_connect(cm_id_, &conn_param)) {
+        fprintf(stderr, "[connect] rdma_connect failed: %s\n", strerror(errno));
         err = ErrorCode::CONNECT_FAILED;
         goto cleanup;
     }
+    fprintf(stderr, "[connect] Step 10: Waiting for ESTABLISHED...\n");
     
     // 等待连接建立
     if (rdma_get_cm_event(channel, &event)) {
+        fprintf(stderr, "[connect] rdma_get_cm_event failed\n");
         err = ErrorCode::CONNECT_FAILED;
         goto cleanup;
     }
     
     if (event->event != RDMA_CM_EVENT_ESTABLISHED) {
+        fprintf(stderr, "[connect] Unexpected event: %d (expected ESTABLISHED=%d)\n", 
+                event->event, RDMA_CM_EVENT_ESTABLISHED);
         rdma_ack_cm_event(event);
         err = ErrorCode::CONNECT_FAILED;
         goto cleanup;
@@ -167,15 +175,9 @@ ErrorCode Connection::connect(const char* addr, uint16_t port, int timeout_ms) {
     rdma_ack_cm_event(event);
     rdma_destroy_event_channel(channel);
     
-    // 转换到RTS状态
-    err = transitionToRTS();
-    if (err != ErrorCode::OK) {
-        rdma_disconnect(cm_id_);
-        goto cleanup;
-    }
-    
     connected_ = true;
     is_server_ = false;
+    fprintf(stderr, "[connect] SUCCESS! Connection established.\n");
     return ErrorCode::OK;
 
 cleanup:
@@ -190,44 +192,71 @@ cleanup:
 }
 
 // 服务端接受连接
-ErrorCode Connection::accept(rdma_cm_id* listener_id, int timeout_ms) {
-    if (!listener_id) return ErrorCode::INVALID_PARAM;
+ErrorCode Connection::accept(rdma_cm_id* conn_id, int timeout_ms) {
+    if (!conn_id) return ErrorCode::INVALID_PARAM;
     
-    cm_id_ = listener_id;
+    fprintf(stderr, "[accept] Starting accept, conn_id=%p\n", conn_id);
+    cm_id_ = conn_id;
     is_server_ = true;
     
+    if (!cm_id_->verbs) {
+        fprintf(stderr, "[accept] ERROR: cm_id->verbs is null\n");
+        return ErrorCode::CREATE_FAILED;
+    }
+    fprintf(stderr, "[accept] Device: %s\n", cm_id_->verbs->device->name);
+    
+    // 创建 PD
+    fprintf(stderr, "[accept] Creating PD...\n");
+    client_pd_ = ibv_alloc_pd(cm_id_->verbs);
+    if (!client_pd_) {
+        fprintf(stderr, "[accept] ibv_alloc_pd failed: %s\n", strerror(errno));
+        return ErrorCode::CREATE_FAILED;
+    }
+    
+    // 创建 CQ
+    fprintf(stderr, "[accept] Creating CQ...\n");
+    client_cq_ = ibv_create_cq(cm_id_->verbs, DEFAULT_CQ_SIZE, nullptr, nullptr, 0);
+    if (!client_cq_) {
+        fprintf(stderr, "[accept] ibv_create_cq failed: %s\n", strerror(errno));
+        ibv_dealloc_pd(client_pd_);
+        client_pd_ = nullptr;
+        return ErrorCode::CREATE_FAILED;
+    }
+    
+    // 创建内存池
+    fprintf(stderr, "[accept] Creating memory pool...\n");
+    client_pool_ = std::make_unique<MemoryPool>(client_pd_);
+    
+    // 创建 QP（rdma_accept 会自动处理状态转换）
+    fprintf(stderr, "[accept] Setting up QP...\n");
     ErrorCode err = setupQP();
     if (err != ErrorCode::OK) {
-        return err;
+        fprintf(stderr, "[accept] setupQP failed: %d\n", (int)err);
+        goto cleanup;
     }
     
-    err = transitionToInit();
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-    
-    err = transitionToRTR();
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-    
+    // 直接调用 rdma_accept，它会自动处理 QP 状态转换
+    fprintf(stderr, "[accept] Calling rdma_accept...\n");
     rdma_conn_param conn_param;
     std::memset(&conn_param, 0, sizeof(conn_param));
     conn_param.initiator_depth = 1;
     conn_param.responder_resources = 1;
     
     if (rdma_accept(cm_id_, &conn_param)) {
-        return ErrorCode::CONNECT_FAILED;
-    }
-    
-    err = transitionToRTS();
-    if (err != ErrorCode::OK) {
-        rdma_reject(cm_id_, nullptr, 0);
-        return err;
+        fprintf(stderr, "[accept] rdma_accept failed: %s\n", strerror(errno));
+        err = ErrorCode::CONNECT_FAILED;
+        goto cleanup;
     }
     
     connected_ = true;
+    fprintf(stderr, "[accept] SUCCESS!\n");
     return ErrorCode::OK;
+
+cleanup:
+    client_pool_.reset();
+    if (client_cq_) { ibv_destroy_cq(client_cq_); client_cq_ = nullptr; }
+    if (client_pd_) { ibv_dealloc_pd(client_pd_); client_pd_ = nullptr; }
+    return err;
 }
 
 // 关闭连接
@@ -241,28 +270,29 @@ void Connection::close() {
         qp_ = nullptr;
     }
     
-    // 客户端需要清理自己的资源
-    if (!is_server_) {
-        client_pool_.reset();
-        if (client_cq_) {
-            ibv_destroy_cq(client_cq_);
-            client_cq_ = nullptr;
-        }
-        if (client_pd_) {
-            ibv_dealloc_pd(client_pd_);
-            client_pd_ = nullptr;
-        }
-        if (cm_id_) {
-            rdma_destroy_id(cm_id_);
-            cm_id_ = nullptr;
-        }
+    // 服务端和客户端都清理自己的资源
+    client_pool_.reset();
+    if (client_cq_) {
+        ibv_destroy_cq(client_cq_);
+        client_cq_ = nullptr;
+    }
+    if (client_pd_) {
+        ibv_dealloc_pd(client_pd_);
+        client_pd_ = nullptr;
+    }
+    
+    // 客户端需要销毁 cm_id，服务端的 cm_id 由 RpcServer 管理
+    if (!is_server_ && cm_id_) {
+        rdma_destroy_id(cm_id_);
+        cm_id_ = nullptr;
     }
 }
 
 // 创建QP
 ErrorCode Connection::setupQP() {
-    ibv_pd* pd = is_server_ ? transport_.pd() : client_pd_;
-    ibv_cq* cq = is_server_ ? transport_.cq() : client_cq_;
+    // 服务端和客户端都使用自己创建的资源
+    ibv_pd* pd = client_pd_;
+    ibv_cq* cq = client_cq_;
     
     if (!pd || !cq || !cm_id_) {
         fprintf(stderr, "[setupQP] ERROR: pd=%p cq=%p cm_id=%p\n", pd, cq, cm_id_);
@@ -358,57 +388,50 @@ ErrorCode Connection::transitionToRTS() {
 
 // 获取内存池引用
 MemoryPool& Connection::pool() {
-    if (is_server_) {
-        return transport_.pool();
-    }
     return *client_pool_;
 }
 
 // 轮询完成事件
 ErrorCode Connection::pollCompletion(ibv_wc& wc, int timeout_ms) {
-    ibv_cq* cq = is_server_ ? transport_.cq() : client_cq_;
-    if (!cq) return ErrorCode::ERROR;
+    if (!client_cq_) return ErrorCode::ERROR;
     
-    if (timeout_ms > 0) {
-        struct pollfd pfd;
-        pfd.fd = cq->channel ? cq->channel->fd : -1;
-        pfd.events = POLLIN;
-        
-        if (poll(&pfd, 1, timeout_ms) <= 0) {
-            return ErrorCode::TIMEOUT;
+    auto start = std::chrono::steady_clock::now();
+    
+    while (true) {
+        int ret = ibv_poll_cq(client_cq_, 1, &wc);
+        if (ret < 0) return ErrorCode::POLL_ERROR;
+        if (ret > 0) {
+            if (wc.status != IBV_WC_SUCCESS) return ErrorCode::ERROR;
+            return ErrorCode::OK;
         }
+        
+        // 检查超时
+        if (timeout_ms > 0) {
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start);
+            if (elapsed.count() >= timeout_ms) {
+                return ErrorCode::TIMEOUT;
+            }
+        }
+        
+        // 短暂休眠避免忙等待
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
-    
-    int ret = ibv_poll_cq(cq, 1, &wc);
-    if (ret < 0) return ErrorCode::POLL_ERROR;
-    if (ret == 0) return ErrorCode::TIMEOUT;
-    if (wc.status != IBV_WC_SUCCESS) return ErrorCode::ERROR;
-    return ErrorCode::OK;
 }
 
 // 获取发送缓冲区
 Buffer Connection::getSendBuffer() {
-    if (is_server_) {
-        return transport_.pool().allocate(4096);
-    }
     return client_pool_->allocate(4096);
 }
 
 // 获取接收缓冲区
 Buffer Connection::getRecvBuffer() {
-    if (is_server_) {
-        return transport_.pool().allocate(4096);
-    }
     return client_pool_->allocate(4096);
 }
 
 // 归还缓冲区
 void Connection::returnBuffer(Buffer& buf) {
-    if (is_server_) {
-        transport_.pool().deallocate(buf);
-    } else {
-        client_pool_->deallocate(buf);
-    }
+    client_pool_->deallocate(buf);
 }
 
 // 发送数据

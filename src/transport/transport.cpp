@@ -4,14 +4,14 @@
 
 namespace drpc {
 
-Transport::Transport() {}
+Transport::Transport() : owns_context_(false) {}
 
 // 析构函数：按序释放RDMA资源
 Transport::~Transport() {
     if (pool_) pool_.reset();
     if (cq_) ibv_destroy_cq(cq_);
     if (pd_) ibv_dealloc_pd(pd_);
-    if (ctx_) ibv_close_device(ctx_);
+    if (ctx_ && owns_context_) ibv_close_device(ctx_);
 }
 
 // 初始化：打开设备、分配PD、创建CQ、创建内存池
@@ -20,30 +20,39 @@ ErrorCode Transport::init() {
     ibv_device** dev_list = ibv_get_device_list(&num_devices);
     if (!dev_list || num_devices == 0) return ErrorCode::NO_DEVICE;
     
-    // 打开第一个RDMA设备
     ctx_ = ibv_open_device(dev_list[0]);
     ibv_free_device_list(dev_list);
     if (!ctx_) return ErrorCode::CREATE_FAILED;
     
-    // 分配保护域
+    owns_context_ = true;
+    return initFromContext();
+}
+
+// 使用指定的context初始化（不拥有context）
+ErrorCode Transport::init(ibv_context* ctx) {
+    if (!ctx) return ErrorCode::INVALID_PARAM;
+    
+    ctx_ = ctx;
+    owns_context_ = false;
+    return initFromContext();
+}
+
+// 从context创建PD、CQ、内存池
+ErrorCode Transport::initFromContext() {
     pd_ = ibv_alloc_pd(ctx_);
     if (!pd_) {
-        ibv_close_device(ctx_);
-        ctx_ = nullptr;
+        if (owns_context_) { ibv_close_device(ctx_); ctx_ = nullptr; }
         return ErrorCode::CREATE_FAILED;
     }
     
-    // 创建完成队列
     cq_ = ibv_create_cq(ctx_, DEFAULT_CQ_SIZE, nullptr, nullptr, 0);
     if (!cq_) {
         ibv_dealloc_pd(pd_);
         pd_ = nullptr;
-        ibv_close_device(ctx_);
-        ctx_ = nullptr;
+        if (owns_context_) { ibv_close_device(ctx_); ctx_ = nullptr; }
         return ErrorCode::CREATE_FAILED;
     }
     
-    // 创建内存池
     pool_ = std::make_unique<MemoryPool>(pd_);
     return ErrorCode::OK;
 }

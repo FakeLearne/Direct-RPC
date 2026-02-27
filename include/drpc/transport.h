@@ -17,12 +17,14 @@ public:
     Transport(const Transport&) = delete;
     Transport& operator=(const Transport&) = delete;
 
-    ErrorCode init();                  // 初始化RDMA资源，返回错误码
+    ErrorCode init();                  // 初始化RDMA资源（打开第一个设备）
+    ErrorCode init(ibv_context* ctx);  // 使用指定的context初始化
     
     ibv_pd* pd() { return pd_; }        // 获取保护域
     ibv_cq* cq() { return cq_; }        // 获取完成队列
     ibv_context* context() { return ctx_; }  // 获取设备上下文
     MemoryPool& pool() { return *pool_; }    // 获取内存池
+    bool initialized() const { return ctx_ != nullptr; }
 
     // 轮询完成事件，返回错误码
     ErrorCode pollCompletion(ibv_wc& wc, int timeout_ms = 0);
@@ -42,10 +44,13 @@ public:
                               uint32_t remote_rkey, uint64_t remote_addr);
 
 private:
+    ErrorCode initFromContext();         // 从context创建资源
+    
     ibv_context* ctx_ = nullptr;        // 设备上下文
     ibv_pd* pd_ = nullptr;              // 保护域
     ibv_cq* cq_ = nullptr;              // 完成队列
     std::unique_ptr<MemoryPool> pool_;  // 内存池
+    bool owns_context_ = false;         // 是否拥有context（决定析构时是否关闭）
 };
 
 // RDMA连接，封装QP状态机和rdma_cm操作

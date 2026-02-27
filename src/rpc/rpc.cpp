@@ -18,11 +18,8 @@ void RpcServer::registerHandler(uint32_t func_id, RpcHandler handler) {
     handlers_[func_id] = handler;
 }
 
-// 启动服务：初始化传输层、绑定地址、开始监听
+// 启动服务：绑定地址、开始监听
 ErrorCode RpcServer::start() {
-    ErrorCode err = transport_.init();
-    if (err != ErrorCode::OK) return err;
-    
     // 创建事件通道
     rdma_event_channel* channel = rdma_create_event_channel();
     if (!channel) return ErrorCode::CREATE_FAILED;
@@ -72,6 +69,7 @@ void RpcServer::stop() {
 void RpcServer::run() {
     if (!listen_id_ || !listen_id_->channel) return;
     
+    fprintf(stderr, "[RpcServer::run] Starting event loop...\n");
     rdma_event_channel* channel = listen_id_->channel;
     
     while (running_) {
@@ -80,15 +78,28 @@ void RpcServer::run() {
         pfd.fd = channel->fd;
         pfd.events = POLLIN;
         
-        if (poll(&pfd, 1, 100) <= 0) continue;
+        int ret = poll(&pfd, 1, 100);
+        if (ret < 0) {
+            fprintf(stderr, "[RpcServer::run] poll error: %s\n", strerror(errno));
+            continue;
+        }
+        if (ret == 0) continue;
         
+        fprintf(stderr, "[RpcServer::run] Got event!\n");
         rdma_cm_event* event = nullptr;
-        if (rdma_get_cm_event(channel, &event)) continue;
+        if (rdma_get_cm_event(channel, &event)) {
+            fprintf(stderr, "[RpcServer::run] rdma_get_cm_event failed: %s\n", strerror(errno));
+            continue;
+        }
+        
+        fprintf(stderr, "[RpcServer::run] Event type: %d\n", event->event);
         
         // 处理连接请求
         if (event->event == RDMA_CM_EVENT_CONNECT_REQUEST) {
+            fprintf(stderr, "[RpcServer::run] Got CONNECT_REQUEST, accepting...\n");
             Connection conn(transport_);
             ErrorCode err = conn.accept(event->id, DEFAULT_TIMEOUT_MS);
+            fprintf(stderr, "[RpcServer::run] accept returned: %d\n", (int)err);
             if (err == ErrorCode::OK) {
                 handleClient(conn);
             }
@@ -110,7 +121,7 @@ void RpcServer::handleClient(Connection& conn) {
         
         // 等待接收完成
         ibv_wc wc;
-        err = transport_.pollCompletion(wc, DEFAULT_TIMEOUT_MS);
+        err = conn.pollCompletion(wc, DEFAULT_TIMEOUT_MS);
         if (err != ErrorCode::OK) break;
         
         // 解析消息头
@@ -135,21 +146,21 @@ void RpcServer::processRequest(Connection& conn, const MsgHeader* hdr) {
     it->second(getMsgPayload(hdr), hdr->payload_len, resp_buf, resp_len);
     
     // 编码并发送响应
-    Buffer send_buf = encodeResponse(transport_.pool(), hdr->seq_id, resp_buf, resp_len);
+    Buffer send_buf = encodeResponse(conn.pool(), hdr->seq_id, resp_buf, resp_len);
     if (!send_buf.valid()) return;
     
     bool use_inline = resp_len <= SMALL_MSG_THRESHOLD;
     ErrorCode err = conn.send(send_buf, MSG_HEADER_SIZE + resp_len, 1, use_inline);
     if (err != ErrorCode::OK) {
-        transport_.pool().deallocate(send_buf);
+        conn.pool().deallocate(send_buf);
         return;
     }
     
     // 等待发送完成
     ibv_wc wc;
-    transport_.pollCompletion(wc, DEFAULT_TIMEOUT_MS);
+    conn.pollCompletion(wc, DEFAULT_TIMEOUT_MS);
     
-    transport_.pool().deallocate(send_buf);
+    conn.pool().deallocate(send_buf);
 }
 
 RpcClient::RpcClient() {
@@ -163,9 +174,16 @@ RpcClient::~RpcClient() {
 ErrorCode RpcClient::connect(const char* addr, uint16_t port, int timeout_ms) {
     if (!addr) return ErrorCode::INVALID_PARAM;
     
+    fprintf(stderr, "[RpcClient::connect] Creating connection...\n");
+    
     // 客户端不需要预先初始化Transport，Connection会在rdma_cm确定设备后创建资源
     conn_ = std::make_unique<Connection>(transport_);
+    
+    fprintf(stderr, "[RpcClient::connect] Calling conn_->connect()...\n");
     ErrorCode err = conn_->connect(addr, port, timeout_ms);
+    
+    fprintf(stderr, "[RpcClient::connect] conn_->connect() returned: %d\n", (int)err);
+    
     if (err != ErrorCode::OK) {
         conn_.reset();
         return err;
