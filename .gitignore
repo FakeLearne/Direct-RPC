@@ -40,3 +40,5 @@ callgrind.out.*
 .cache/
 
 improvement_suggestions.md
+COMMUNICATION_FLOW.md
+TROUBLESHOOTING.md
